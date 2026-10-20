@@ -1,209 +1,108 @@
 /*
-Copyright (c) 2013 Microsoft Corporation. All rights reserved.
+Copyright (c) 2026 Lean FRO, LLC. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
 
-Author: Leonardo de Moura
+Author: Sofia Rodrigues
 */
 #pragma once
-#include <algorithm>
+#include <lean/lean.h>
+#include "runtime/io.h"
+#include <cerrno>
+#include <climits>
 #include <cstring>
-#include "runtime/debug.h"
-#include "runtime/optional.h"
+
+#ifndef LEAN_EMSCRIPTEN
+#include <uv.h>
+#include <memory>
+#include <new>
+#endif
 
 namespace lean {
-/**
-    \brief Very similar to std::vector, but stores elements on the
-    system stack when collection has less than \c INITIAL_SIZE.
-    This collection is useful when writing functions that need
-    temporary storage.
-*/
-template<typename T, size_t INITIAL_SIZE = 16>
-class buffer {
-protected:
-    T *      m_buffer;
-    size_t   m_pos;
-    size_t   m_capacity;
-    char     m_initial_buffer[INITIAL_SIZE * sizeof(T)];
 
-    void free_memory() {
-        if (m_buffer != reinterpret_cast<T*>(m_initial_buffer))
-            #if __cpp_sized_deallocation >= 201309L
-                operator delete[](reinterpret_cast<char*>(m_buffer), sizeof(T) * m_capacity);
-            #else
-                delete[] reinterpret_cast<char*>(m_buffer);
-            #endif
+// `nullptr` if `size` is a valid receive buffer size. libuv reports an empty buffer as `UV_ENOBUFS`,
+// which would read as a resource shortage, and takes the length as 32 bits on Windows.
+inline lean_obj_res recv_size_error(uint64_t size) {
+    if (size == 0) {
+        return lean_io_result_mk_error(lean_mk_io_error_invalid_argument(EINVAL, lean_mk_string("receive buffer size must be positive")));
     }
 
-    void set_capacity(size_t new_capacity) {
-        lean_assert(new_capacity > m_capacity);
-        char * new_buffer_char = new char[sizeof(T) * new_capacity];
-        T * new_buffer         = reinterpret_cast<T*>(new_buffer_char);
-        std::uninitialized_copy(m_buffer, m_buffer + m_pos, new_buffer);
-        destroy();
-        m_buffer              = new_buffer;
-        m_capacity            = new_capacity;
+    if (size > UINT_MAX) {
+        return lean_io_result_mk_error(lean_mk_io_error_invalid_argument(EINVAL, lean_mk_string("receive buffer size must be smaller than 4 GiB")));
     }
 
-    void expand() {
-        set_capacity(m_capacity << 1);
+    return nullptr;
+}
+
+// Sets the size of a receive buffer to the `nread` bytes it received. A read that fills less than half
+// of it is moved to a buffer of its own size instead, so that many small reads do not each keep a
+// full-sized buffer alive.
+inline lean_object * fit_read_buffer(lean_object * byte_array, size_t nread) {
+    if (nread * 2 >= lean_sarray_capacity(byte_array)) {
+        lean_sarray_set_size(byte_array, nread);
+        return byte_array;
     }
 
-    void destroy_elements() {
-        std::for_each(begin(), end(), [](T & e) { e.~T(); });
-    }
+    lean_object * fitted = lean_alloc_sarray(1, nread, nread);
+    memcpy(lean_sarray_cptr(fitted), lean_sarray_cptr(byte_array), nread);
+    lean_dec(byte_array);
+    return fitted;
+}
 
-    void destroy() {
-        destroy_elements();
-        free_memory();
-    }
+#ifndef LEAN_EMSCRIPTEN
+
+// The `uv_buf_t` array for sending an `Array ByteArray`, on the stack unless it is large. `uv_write`
+// and `uv_udp_send` copy the array before returning, so it only has to outlive that call. The bytes
+// must outlive the request, so the request keeps the `Array ByteArray`.
+class uv_send_bufs {
+    static constexpr size_t inline_capacity = 16;
+
+    uv_buf_t m_inline[inline_capacity];
+    std::unique_ptr<uv_buf_t[]> m_heap;
+    uv_buf_t * m_data = m_inline;
+    unsigned int m_count = 0;
 
 public:
-    typedef T value_type;
-    typedef T * iterator;
-    typedef T const * const_iterator;
+    uv_send_bufs() = default;
+    uv_send_bufs(uv_send_bufs const &) = delete;
+    uv_send_bufs & operator=(uv_send_bufs const &) = delete;
 
-    buffer():
-        m_buffer(reinterpret_cast<T *>(m_initial_buffer)),
-        m_pos(0),
-        m_capacity(INITIAL_SIZE) {
-    }
+    // Points the buffers at the bytes of `data_array`. `nullptr` on success, and otherwise the error to
+    // return. libuv takes buffer lengths and the buffer count as `unsigned int`, so larger ones are
+    // rejected rather than truncated.
+    [[nodiscard]] lean_obj_res init(b_obj_arg data_array) {
+        size_t len = lean_array_size(data_array);
 
-    buffer(buffer const & source):
-        m_buffer(reinterpret_cast<T *>(m_initial_buffer)),
-        m_pos(0),
-        m_capacity(INITIAL_SIZE) {
-        std::for_each(source.begin(), source.end(), [=, this](T const & e) { push_back(e); });
-    }
-
-    void ensure_capacity(size_t new_capacity) {
-        if (new_capacity > m_capacity) {
-            set_capacity(new_capacity);
+        if (len > UINT_MAX) {
+            return lean_io_result_mk_error(lean_mk_io_error_invalid_argument(EINVAL, lean_mk_string("too many buffers to send")));
         }
-    }
 
-    ~buffer() { destroy(); }
-
-    buffer & operator=(buffer const & source) {
-        clear();
-        std::for_each(source.begin(), source.end(), [=, this](T const & e) { push_back(e); });
-        return *this;
-    }
-
-    bool operator==(buffer const & other) const {
-        if (size() != other.size()) {
-            return false;
-        } else {
-            for (size_t i = 0; i < size(); i++) {
-                if (operator[](i) != other[i])
-                    return false;
-            }
-            return true;
-        }
-    }
-
-    bool operator!=(buffer const & other) const {
-        return !operator==(other);
-    }
-
-    T const & back() const { lean_assert(!empty() && m_pos > 0); return m_buffer[m_pos - 1]; }
-    T & back() { lean_assert(!empty() && m_pos > 0); return m_buffer[m_pos - 1]; }
-    T & operator[](size_t idx) { lean_assert(idx < size());  return m_buffer[idx]; }
-    T const & operator[](size_t idx) const { lean_assert(idx < size()); return m_buffer[idx]; }
-    void clear() { destroy_elements(); m_pos = 0; }
-    size_t size() const { return m_pos; }
-    T const * data() const { return m_buffer; }
-    T * data() { return m_buffer; }
-    bool empty() const { return m_pos == 0;  }
-    iterator begin() { return m_buffer; }
-    iterator end() { return m_buffer + size(); }
-    const_iterator begin() const { return m_buffer; }
-    const_iterator end() const { return m_buffer + size(); }
-    size_t capacity() const { return m_capacity; }
-
-    void push_back(T const & elem) {
-        if (m_pos >= m_capacity)
-            expand();
-        new (m_buffer + m_pos) T(elem);
-        m_pos++;
-    }
-
-    template<typename... Args>
-    void emplace_back(Args&&... args) {
-        if (m_pos >= m_capacity)
-            expand();
-        new (m_buffer + m_pos) T(args...);
-        m_pos++;
-    }
-
-    void pop_back() {
-        back().~T();
-        m_pos--;
-    }
-
-    void append(size_t sz, T const * elems) {
-        ensure_capacity(size() + sz);
-        for (size_t i = 0; i < sz; i++)
-            push_back(elems[i]);
-    }
-
-    template<typename C>
-    void append(C const & c) {
-        append(c.size(), c.data());
-    }
-
-    void resize(size_t nsz, T const & elem = T()) {
-        size_t sz = size();
-        if (nsz > sz) {
-            ensure_capacity(nsz);
-            for (size_t i = sz; i < nsz; i++)
-                push_back(elem);
-        } else if (nsz < sz) {
-            for (size_t i = nsz; i < sz; i++)
-                pop_back();
-        }
-        lean_assert(size() == nsz);
-    }
-
-    void erase(size_t idx) {
-        lean_assert(idx < size());
-        for (size_t i = idx+1; i < size(); i++)
-            m_buffer[i-1] = std::move(m_buffer[i]);
-        pop_back();
-    }
-
-    void erase_elem(T const & elem) {
-        for (size_t i = 0; i < size(); i++) {
-            if (m_buffer[i] == elem) {
-                erase(i);
-                return;
+        for (size_t i = 0; i < len; i++) {
+            if (lean_sarray_size(lean_array_get_core(data_array, i)) > UINT_MAX) {
+                return lean_io_result_mk_error(lean_mk_io_error_invalid_argument(EINVAL, lean_mk_string("buffer to send must be smaller than 4 GiB")));
             }
         }
-    }
 
-    optional<size_t> index_of(T const & elem) const {
-        for (size_t i = 0; i < size(); i++)
-            if (m_buffer[i] == elem) return optional<size_t>(i);
-        return optional<size_t>();
-    }
-
-    void insert(size_t idx, T const & elem) {
-        using std::swap;
-        lean_assert(idx <= size());
-        push_back(elem);
-        size_t i = size();
-        while (i > idx + 1) {
-            --i;
-            swap(m_buffer[i], m_buffer[i-1]);
+        if (len > inline_capacity) {
+            m_heap.reset(new (std::nothrow) uv_buf_t[len]);
+            if (m_heap == nullptr) {
+                return io_result_mk_enomem();
+            }
+            m_data = m_heap.get();
         }
+
+        for (size_t i = 0; i < len; i++) {
+            lean_object * byte_array = lean_array_get_core(data_array, i);
+            m_data[i] = uv_buf_init((char*)lean_sarray_cptr(byte_array), lean_sarray_size(byte_array));
+        }
+
+        m_count = len;
+        return nullptr;
     }
 
-    void shrink(size_t nsz) {
-        size_t sz = size();
-        lean_assert(nsz <= sz);
-        for (size_t i = nsz; i < sz; i++)
-            pop_back();
-        lean_assert(size() == nsz);
-    }
+    uv_buf_t const * data() const { return m_data; }
+    unsigned int count() const { return m_count; }
 };
+
+#endif
 
 }
