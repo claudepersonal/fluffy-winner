@@ -8,6 +8,6 @@ Author: Leonardo de Moura
 #include "runtime/object.h"
 
 namespace lean {
-LEAN_EXPORT void initialize_constructions_module();
-LEAN_EXPORT void finalize_constructions_module();
+LEAN_EXPORT void initialize_kernel_module();
+LEAN_EXPORT void finalize_kernel_module();
 }
